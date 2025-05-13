@@ -1,0 +1,62 @@
+# Backend (Python/Django)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Django
+backend/*.log
+backend/*.pot
+backend/*.pyc
+backend/db.sqlite3
+backend/db.sqlite3-journal
+backend/media/
+
+# Frontend (Node.js/Vue.js)
+frontend/node_modules/
+frontend/.DS_Store
+frontend/dist/
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*
+frontend/.env.local
+frontend/.env.*.local
+frontend/coverage/
+frontend/dist/
+frontend/.vite/
+
+# Editor directories and files
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.swp
+*.swo
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Project specific
+/backend/download_data/
+/backend/test_dataset/
+/backend/venv/ 
