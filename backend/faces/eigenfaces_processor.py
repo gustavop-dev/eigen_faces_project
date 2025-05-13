@@ -4,16 +4,19 @@ import cv2
 from PIL import Image
 from django.conf import settings
 import json
+import gc  # Garbage collector
 
 class EigenfacesProcessor:
-    def __init__(self, image_size=(100, 100)):
+    def __init__(self, image_size=(100, 100), batch_size=10):
         """
         Initialize the eigenfaces processor with the specified image size
         
         Args:
             image_size (tuple): Standard dimensions to resize all face images (width, height)
+            batch_size (int): Number of images to process in one batch
         """
         self.image_size = image_size
+        self.batch_size = batch_size
         self.mean_face = None
         self.eigenfaces = None
         self.projected_training_faces = []
@@ -83,14 +86,89 @@ class EigenfacesProcessor:
         
         return np.array(training_data)
     
-    def train(self, face_images, max_eigenfaces=150):
+    def prepare_training_data_batch(self, face_images):
         """
-        Train the eigenfaces model with memory optimization:
-        - Calculate the mean face
-        - Subtract mean from each face
-        - Compute eigenfaces (eigenvectors of covariance matrix)
+        Similar to prepare_training_data but yields batches of data
+        to avoid loading all images into memory at once
         
-        For large datasets, limit the number of eigenfaces to save memory
+        Args:
+            face_images (list): List of FaceImage model instances
+            
+        Yields:
+            tuple: (batch_data, batch_labels) for each batch
+        """
+        batch_data = []
+        batch_labels = []
+        
+        for face in face_images:
+            img_path = face.image.path
+            person_id = face.person.id
+            
+            try:
+                # If the image has already been processed and has features_vector,
+                # use it directly to save memory and processing time
+                if face.processed and face.features_vector:
+                    img_vector = np.array(face.features_vector)
+                else:
+                    img_vector = self.preprocess_image(img_path)
+                
+                batch_data.append(img_vector)
+                batch_labels.append(person_id)
+                
+                # Yield the batch and clear memory when we have enough samples
+                if len(batch_data) >= self.batch_size:  # Process batch_size images at a time
+                    yield np.array(batch_data), batch_labels
+                    batch_data = []
+                    batch_labels = []
+                    gc.collect()  # Explicitly trigger garbage collection
+                    
+            except Exception as e:
+                print(f"Error processing image {img_path}: {e}")
+        
+        # Yield any remaining images
+        if batch_data:
+            yield np.array(batch_data), batch_labels
+    
+    def compute_mean_face(self, face_images):
+        """
+        Compute the mean face incrementally to save memory
+        
+        Args:
+            face_images (list): List of FaceImage model instances
+            
+        Returns:
+            numpy.ndarray: The mean face vector
+        """
+        # Get the shape from the first image
+        sample_image = face_images[0]
+        if sample_image.processed and sample_image.features_vector:
+            vector_length = len(sample_image.features_vector)
+        else:
+            img_path = sample_image.image.path
+            vector_length = self.preprocess_image(img_path).shape[0]
+        
+        # Initialize sum and count
+        face_sum = np.zeros(vector_length)
+        count = 0
+        
+        # Process in batches
+        for batch_data, _ in self.prepare_training_data_batch(face_images):
+            face_sum += np.sum(batch_data, axis=0)
+            count += batch_data.shape[0]
+            
+            # Free memory
+            del batch_data
+            gc.collect()
+        
+        # Calculate mean
+        if count > 0:
+            return face_sum / count
+        else:
+            raise ValueError("No valid training images found")
+    
+    def train_with_batches(self, face_images, max_eigenfaces=150):
+        """
+        Train the eigenfaces model using batch processing to save memory
         
         Args:
             face_images (list): List of FaceImage model instances
@@ -99,22 +177,35 @@ class EigenfacesProcessor:
         Returns:
             dict: Dictionary containing the mean_face and eigenfaces as lists
         """
-        # Prepare training data
-        training_data = self.prepare_training_data(face_images)
+        if len(face_images) < 2:
+            raise ValueError("Need at least 2 face images to train the model")
         
-        if len(training_data) == 0:
-            raise ValueError("No valid training images found")
+        print("Computing mean face incrementally...")
+        self.mean_face = self.compute_mean_face(face_images)
         
-        # Calculate mean face
-        self.mean_face = np.mean(training_data, axis=0)
+        # We'll use an approximation method for large datasets
+        # Instead of computing the full covariance matrix, we'll use a subset of images
+        # to compute the principal components (eigenfaces)
+        
+        print("Computing covariance matrix approximation...")
+        
+        # Use a subset of images if there are too many
+        max_sample_size = min(100, len(face_images))  # Limit to 100 images for SVD computation
+        sample_images = face_images[:max_sample_size]
+        
+        # Prepare the sampled training data
+        training_data = self.prepare_training_data(sample_images)
+        
+        # Store all training labels
+        self.training_labels = []
+        for face in face_images:
+            self.training_labels.append(face.person.id)
         
         # Subtract mean from each face
         normalized_faces = training_data - self.mean_face
         
         # Use SVD method for eigenface calculation (more memory efficient)
-        # We're using the trick that for high-dimensional data, we can compute
-        # the eigenvectors of X*X^T instead of X^T*X
-        print("Computing SVD decomposition...")
+        print("Computing SVD decomposition on sample...")
         
         # Compute reduced SVD to save memory
         U, s, Vt = np.linalg.svd(normalized_faces, full_matrices=False)
@@ -127,15 +218,43 @@ class EigenfacesProcessor:
         # which we can get from the V matrix of SVD
         self.eigenfaces = Vt[:max_k]
         
-        # Project training faces into eigenspace
-        # We can do this with a batch operation to save memory
-        self.projected_training_faces = np.dot(normalized_faces, self.eigenfaces.T)
+        # Project all training faces into eigenspace batch by batch
+        print("Projecting all training faces into eigenspace...")
+        self.projected_training_faces = []
+        
+        for batch_data, _ in self.prepare_training_data_batch(face_images):
+            # Normalize faces by subtracting mean face
+            normalized_batch = batch_data - self.mean_face
+            
+            # Project faces onto eigenspace
+            projected_batch = np.dot(normalized_batch, self.eigenfaces.T)
+            
+            # Store projections
+            self.projected_training_faces.extend(projected_batch.tolist())
+            
+            # Free memory
+            del batch_data, normalized_batch, projected_batch
+            gc.collect()
         
         # Return the model for saving
         return {
             'mean_face': self.mean_face.tolist(),
             'eigenfaces': self.eigenfaces.tolist()
         }
+    
+    def train(self, face_images, max_eigenfaces=150):
+        """
+        Train the eigenfaces model - this is now a wrapper around 
+        train_with_batches for memory optimization
+        
+        Args:
+            face_images (list): List of FaceImage model instances
+            max_eigenfaces (int): Maximum number of eigenfaces to retain
+            
+        Returns:
+            dict: Dictionary containing the mean_face and eigenfaces as lists
+        """
+        return self.train_with_batches(face_images, max_eigenfaces)
     
     def project_faces(self, faces):
         """
@@ -226,6 +345,40 @@ class EigenfacesProcessor:
         if eigenfaces_model.mean_face and eigenfaces_model.eigenfaces:
             self.mean_face = np.array(eigenfaces_model.mean_face)
             self.eigenfaces = np.array(eigenfaces_model.eigenfaces)
+            
+            # First try to load the stored projections and labels
+            if eigenfaces_model.projected_faces and eigenfaces_model.training_labels:
+                self.projected_training_faces = eigenfaces_model.projected_faces
+                self.training_labels = eigenfaces_model.training_labels
+                print(f"Loaded {len(self.projected_training_faces)} projected training faces from model")
+                return True
+            
+            # If no stored projections, regenerate them
+            from .models import Person, FaceImage
+            
+            print("Regenerating projections for recognition...")
+            training_data = []
+            self.training_labels = []
+            
+            # Get all persons and their images
+            for person in Person.objects.all():
+                # Get processed images for this person
+                face_images = FaceImage.objects.filter(person=person, processed=True)
+                
+                for face in face_images:
+                    if face.processed and face.features_vector:
+                        # Use stored feature vector directly if available
+                        img_vector = np.array(face.features_vector)
+                        training_data.append(img_vector)
+                        self.training_labels.append(person.id)
+            
+            if training_data:
+                # Project all the training data into eigenspace
+                training_data = np.array(training_data)
+                normalized_faces = training_data - self.mean_face
+                self.projected_training_faces = np.dot(normalized_faces, self.eigenfaces.T).tolist()
+                print(f"Loaded and projected {len(self.projected_training_faces)} training faces")
+            
             return True
         return False
     
@@ -245,7 +398,9 @@ class EigenfacesProcessor:
         model = EigenfacesModel(
             name=name,
             mean_face=self.mean_face.tolist(),
-            eigenfaces=self.eigenfaces.tolist()
+            eigenfaces=self.eigenfaces.tolist(),
+            projected_faces=self.projected_training_faces,
+            training_labels=self.training_labels
         )
         model.save()
         

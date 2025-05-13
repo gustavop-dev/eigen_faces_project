@@ -25,6 +25,8 @@ class EigenfacesModel(models.Model):
     is_active = models.BooleanField(default=True)
     mean_face = models.JSONField(null=True, blank=True)
     eigenfaces = models.JSONField(null=True, blank=True)
+    projected_faces = models.JSONField(null=True, blank=True)
+    training_labels = models.JSONField(null=True, blank=True)
     
     def __str__(self):
         return self.name
